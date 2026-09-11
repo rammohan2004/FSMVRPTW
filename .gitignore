@@ -1,0 +1,57 @@
+# Generated benchmark instances. Not committed: they are reproducible byte for
+# byte from instance-generator/ plus the Solomon sources in cuOpt/testcases/,
+# and they get large fast (1k = 14 MB, 10k ~ 140 MB, 100k ~ 1.4 GB).
+# cuOpt/instances/README.md IS committed, so the regeneration commands survive
+# even though the instances themselves do not. NB: these patterns contain a
+# slash, so git anchors them to this file's directory -- a bare "instances/*"
+# would NOT match cuOpt/instances/.
+# cuOpt/instances/*
+# !cuOpt/instances/README.md
+
+# The self-contained Paramshakti run folder. Its scripts are committed; the
+# generated instances (83 MB, and regenerable) are not.
+cuOpt_FSMVRPTW/instances/
+cuOpt_FSMVRPTW/outputs_cuopt/*.csv
+
+# Our solver. Source is committed; instances are regenerable, build artefacts
+# and run output are not worth versioning.
+FSMVRPTW_Solver/instances/
+FSMVRPTW_Solver/reference/
+FSMVRPTW_Solver/outputs/
+FSMVRPTW_Solver/solve_cvrptw
+FSMVRPTW_Solver/**/*.o
+FSMVRPTW_Solver/**/*.d
+FSMVRPTW_Solver/.build_mode
+
+# Scratch from the smoke test, and SLURM job logs.
+# cuOpt/smoke_in/
+# cuOpt/smoke_routes/
+# cuOpt/*.out
+# cuOpt/*.err
+
+# NOTE: cuOpt/outputs_cuopt/*.csv is deliberately NOT ignored. Result sheets are
+# small and are the one thing here that cannot be regenerated -- they depend on
+# the GPU and on wall-clock timing -- so they belong in version control.
+
+# Text dumps extracted from PDFs while reading them. Scratch, regenerate as needed.
+Papers/_*.txt
+paramshakthi/manual.txt
+
+__pycache__/
+*.pyc
+
+
+Background_Material/
+
+Papers/
+paramshakthi/
+Dinesh-Code-Base/
+Sneh-Code-Base/
+Results/
+Algorithm-Ideas.md
+MTP-Notes.md
+cuOpt/
+
+cuOpt-Baseline-Findings.md
+Dinesh-Code-Base.zip
+Solver-Port-Plan.md

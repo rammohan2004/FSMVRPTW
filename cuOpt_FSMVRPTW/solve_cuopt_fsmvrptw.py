@@ -563,11 +563,20 @@ def main():
     parser.add_argument("--output_csv",
                         default="outputs_cuopt/fsmvrptw_results.csv",
                         help="CSV to append results to")
-    parser.add_argument("--timeouts", type=float, nargs="+",
+    # nargs="*" so `--timeouts` with no values runs ONLY the per-instance
+    # equal-time budgets from --match-times, with no ladder on top.
+    parser.add_argument("--timeouts", type=float, nargs="*",
                         default=[60, 10, 5, 2],
                         help="time limits in seconds per instance; same ladder "
                              "as solve_cuopt.py so the two result sheets line "
                              "up at each time limit")
+    parser.add_argument("--match-times", metavar="CSV", default=None,
+                        help="CSV from our own solver (columns: instance, "
+                             "solve_time_s). For each instance, cuOpt is ALSO "
+                             "given that instance's own runtime as a time "
+                             "limit, giving an exact equal-time comparison "
+                             "rather than one read off a coarse ladder. "
+                             "Instances are matched on basename.")
     parser.add_argument("--max-fleet", type=int, default=None,
                         help="cap the total vehicles handed to cuOpt; every "
                              "type is scaled down proportionally, never below 1")
@@ -620,6 +629,19 @@ def main():
         if write_header:
             writer.writeheader()
 
+        # Per-instance equal-time budgets, if our own results were supplied.
+        match_times = {}
+        if args.match_times:
+            with open(args.match_times, newline="") as mf:
+                for r in csv.DictReader(mf):
+                    key = os.path.basename(r.get("instance", "")).strip()
+                    try:
+                        match_times[key] = float(r["solve_time_s"])
+                    except (KeyError, ValueError):
+                        continue
+            print("Loaded %d per-instance time budgets from %s\n"
+                  % (len(match_times), args.match_times))
+
         for filepath in files:
             instance_name = os.path.basename(filepath)
             try:
@@ -639,7 +661,17 @@ def main():
             # Built once and shared by every time limit for this instance.
             dist_matrix = build_distance_matrix(inst["coords"])
 
-            for timeout in args.timeouts:
+            # The instance's own equal-time budget first, then the ladder.
+            # Rounded to 0.1 s so the column stays readable; deduped in case a
+            # ladder rung already sits on that value.
+            timeouts = list(args.timeouts)
+            if instance_name in match_times:
+                matched = round(match_times[instance_name], 1)
+                if matched not in timeouts:
+                    timeouts = [matched] + timeouts
+                print("  equal-time budget for this instance: %g s" % matched)
+
+            for timeout in timeouts:
                 row = {
                     "instance": instance_name,
                     "family": fam,

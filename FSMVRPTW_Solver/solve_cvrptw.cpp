@@ -1,10 +1,15 @@
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <vector>
 
 #include "lib/clark/clarke_wright.h"
 #include "lib/cluster/clustering.h"
+#include "lib/optim/consolidation.h"
 #include "lib/optim/inter_route_optimization.h"
 #include "lib/optim/intra_route_optimization.h"
 #include "lib/route_utils.h"
@@ -15,24 +20,19 @@ using namespace std;
 int main(int argc, char *argv[]) {
   VRP vrp;
   if (argc < 3) {
-    cout << "seqCVRPTW version 3" << '\n';
-    cout << "Usage: " << argv[0] << " toy.vrp angle_range" << '\n';
+    cout << "seqFSMVRPTW version 1" << '\n';
+    cout << "Usage: " << argv[0] << " instance.txt angle_range [results.csv]"
+         << '\n';
     exit(1);
   }
+  const string csv_path = (argc > 3) ? argv[3] : "solver_results.csv";
 
   vrp.read(argv[1]);
-  vrp.cal_graph_dist();
+  vrp.cal_dist();
 
   chrono::steady_clock::time_point total_start = chrono::steady_clock::now();
   chrono::steady_clock::time_point pre_start = chrono::steady_clock::now();
 
-  int n_clusters;
-  int sum_demand = 0;
-  for (size_t i = 1; i < vrp.getSize(); i++) {
-    sum_demand += vrp.node[i].demand;
-  }
-  n_clusters = sum_demand / vrp.getCapacity();
-  (void)n_clusters;
 
   
   double angle_range = stod(argv[2]);
@@ -47,12 +47,24 @@ int main(int argc, char *argv[]) {
   
 
 
-  for (int i = 0; i < static_cast<int>(clusters.size()); i++) {
-    cout << "Cluster " << i << ": ";
-    for (auto node : clusters[i]) {
-      cout << node << " ";
+  // Cluster sizes only. Dumping every cluster's full membership printed 10,000
+  // customer ids per instance at 10k and 100,000 at 100k, which buries the
+  // result line and costs real I/O time on a shared filesystem. Set
+  // FSMVRPTW_DUMP_CLUSTERS=1 to get the full listing back for debugging.
+  const bool dump_clusters = getenv("FSMVRPTW_DUMP_CLUSTERS") != nullptr;
+  cout << "Clusters: " << clusters.size() << " [";
+  for (size_t i = 0; i < clusters.size(); i++) {
+    cout << (i ? " " : "") << clusters[i].size();
+  }
+  cout << "]" << endl;
+  if (dump_clusters) {
+    for (size_t i = 0; i < clusters.size(); i++) {
+      cout << "Cluster " << i << ": ";
+      for (auto node : clusters[i]) {
+        cout << node << " ";
+      }
+      cout << endl;
     }
-    cout << endl;
   }
 
   chrono::steady_clock::time_point pre_end = chrono::steady_clock::now();
@@ -112,50 +124,172 @@ int main(int argc, char *argv[]) {
   
   weight_t post_process_it_cost = calculate_total_cost(vrp, best_routes);
 
+  // Consolidation: eliminate whole routes by redistributing their customers.
+  // Runs LAST, on routes the rest of the local search has already tidied, so
+  // every remaining route is a genuine candidate rather than a construction
+  // artefact. This is the only move in the pipeline that attacks the fixed-cost
+  // term directly -- step 6 measured fixed cost at ~64% of the objective.
+  //
+  // Interleaved with the inter-route moves rather than run once. Eliminating a
+  // route reshapes the ones that absorbed its customers, and the relocate/swap
+  // moves then tidy those routes and free up slack that lets the NEXT route be
+  // emptied. Run alone the move stalls as soon as no single route can be emptied
+  // whole; alternated, each pass creates the conditions for the next. It costs
+  // ~0.014 s per call against a budget measured in seconds, so the loop is
+  // effectively free.
+  chrono::steady_clock::time_point consol_start = chrono::steady_clock::now();
+  // Built once for the whole instance, not once per round: it depends only on
+  // the instance geometry, and rebuilding it is O(n^2) each time.
+  const vector<vector<node_t>> knn = build_neighbour_lists(vrp, 30);
+  for (int round = 0; round < 10; ++round) {
+    if (!consolidate_routes(vrp, best_routes, knn)) {
+      break;  // nothing left to eliminate; further tidying will not change that
+    }
+#ifdef USE_PARALLEL
+    inter_route_relocate_parallel(vrp, best_routes);
+    inter_route_2opt_star_parallel(vrp, best_routes);
+#else
+    inter_route_relocate(vrp, best_routes);
+    inter_route_2opt_star(vrp, best_routes);
+#endif
+  }
+  chrono::steady_clock::time_point consol_end = chrono::steady_clock::now();
+  weight_t post_consolidation_cost = calculate_total_cost(vrp, best_routes);
+
   chrono::steady_clock::time_point post_end = chrono::steady_clock::now();
   chrono::steady_clock::time_point total_end = chrono::steady_clock::now();
 
   // auto best_routes=routes;
 
   min_cost = calculate_total_cost(vrp, best_routes);
-  print_routes(best_routes);
-
-  if (verify_route(vrp, best_routes)) {
-    cerr << "File: " << argv[1] << " ";
-    cerr << "Preprocessing_Time: "
-         << static_cast<double>(
-                chrono::duration_cast<chrono::nanoseconds>(pre_end - pre_start)
-                    .count() *
-                1.E-9)
-         << " s ";
-    cerr << "Route_Construction_Time: "
-         << static_cast<double>(
-                chrono::duration_cast<chrono::nanoseconds>(mid_end - mid_start)
-                    .count() *
-                1.E-9)
-         << " s ";
-    cerr << "Post_Optimization_Time: "
-         << static_cast<double>(
-                chrono::duration_cast<chrono::nanoseconds>(post_end - post_start)
-                    .count() *
-                1.E-9)
-         << " s ";
-    cerr << "Initial_Cost: " << min_cost1 << " ";
-    cerr << "Post_Relocate_Cost: " << post_relocate_cost << " ";
-    cerr << "Post_Swap_Cost: " << post_swap_cost << " ";
-    cerr << "Post_2opt_star_Cost: " << post_2opt_star_cost << " ";
-    cerr << "Intra_Route_Optimization_Cost: " << post_process_it_cost << " ";
-    cerr << "Final_Cost: " << min_cost << " ";
-    cerr << "Total_Time: "
-         << static_cast<double>(
-                chrono::duration_cast<chrono::nanoseconds>(total_end - total_start)
-                    .count() *
-                1.E-9)
-         << " s ";
-    cerr << "Vehicle_Used: " << best_routes.size() << " ";
-    cerr << "route_length: " << max_length_of_route(best_routes) << " ";
-    cerr << "VALID" << endl;
+  // The full route listing is the same scale problem as the cluster dump: every
+  // customer printed once, so 100,000 ids at the largest size. It is genuinely
+  // useful for inspecting a solution (it is how the depot-wrapping bug was
+  // found), so it stays -- behind the same switch.
+  if (dump_clusters) {
+    print_routes(best_routes);
   }
 
-  return 0;
+  const double routing = total_routing_cost(vrp, best_routes);
+  const double fixed = total_fixed_cost(vrp, best_routes);
+  const double total = calculate_total_cost(vrp, best_routes);
+  const int used = count_vehicles_used(best_routes);
+  const double recomputed = recompute_routing_cost(vrp, best_routes);
+
+  const double total_seconds = static_cast<double>(
+      chrono::duration_cast<chrono::nanoseconds>(total_end - total_start)
+          .count() *
+      1.E-9);
+
+  // Verification. Our own solver gets more scrutiny than cuOpt's, not less:
+  // a bug that flatters our own result is the worst outcome available.
+  const bool feasible = verify_route(vrp, best_routes);
+  const bool visited = all_customers_visited_once(vrp, best_routes);
+  const bool dist_ok =
+      fabs(routing - recomputed) <= 1e-6 * max(1.0, fabs(routing));
+  const bool split_ok =
+      fabs(routing + fixed - total) <= 1e-6 * max(1.0, fabs(total));
+  const bool all_ok = feasible && visited && dist_ok && split_ok;
+
+  // Per-phase detail, for tracking where cost is won.
+  cerr << "File: " << argv[1] << " ";
+  cerr << "Preprocessing_Time: "
+       << static_cast<double>(
+              chrono::duration_cast<chrono::nanoseconds>(pre_end - pre_start)
+                  .count() *
+              1.E-9)
+       << " s ";
+  cerr << "Route_Construction_Time: "
+       << static_cast<double>(
+              chrono::duration_cast<chrono::nanoseconds>(mid_end - mid_start)
+                  .count() *
+              1.E-9)
+       << " s ";
+  cerr << "Post_Optimization_Time: "
+       << static_cast<double>(
+              chrono::duration_cast<chrono::nanoseconds>(post_end - post_start)
+                  .count() *
+              1.E-9)
+       << " s ";
+  cerr << "Initial_Cost: " << min_cost1 << " ";
+  cerr << "Post_Relocate_Cost: " << post_relocate_cost << " ";
+  cerr << "Post_Swap_Cost: " << post_swap_cost << " ";
+  cerr << "Post_2opt_star_Cost: " << post_2opt_star_cost << " ";
+  cerr << "Intra_Route_Optimization_Cost: " << post_process_it_cost << " ";
+  cerr << "Post_Consolidation_Cost: " << post_consolidation_cost << " ";
+  cerr << "Consolidation_Time: "
+       << static_cast<double>(
+              chrono::duration_cast<chrono::nanoseconds>(consol_end -
+                                                         consol_start)
+                  .count() *
+              1.E-9)
+       << " s ";
+  cerr << "Total_Cost: " << total << " ";
+  cerr << "Routing_Cost: " << routing << " ";
+  cerr << "Fixed_Cost: " << fixed << " ";
+  cerr << "Total_Time: " << total_seconds << " s ";
+  cerr << "Vehicle_Used: " << used << " ";
+  cerr << "Mix: " << mix_string(vrp, best_routes) << " ";
+  cerr << "route_length: " << max_length_of_route(best_routes) << " ";
+  // Printed whether or not the solution is valid. The original only printed on
+  // success, so an invalid answer produced no output at all and looked like a
+  // crash.
+  cerr << (all_ok ? "VALID" : "INVALID") << endl;
+
+  if (!all_ok) {
+    cerr << "  CHECK FAILED:";
+    if (!feasible) cerr << " capacity/time-window";
+    if (!visited) cerr << " customer-coverage";
+    if (!dist_ok) cerr << " routing-cost-recompute";
+    if (!split_ok) cerr << " cost-split";
+    cerr << endl;
+  }
+
+  // One CSV row, same column names as the cuOpt harness so both solvers'
+  // results can sit in a single sheet.
+  {
+    ostringstream caps, fixes;
+    for (size_t k = 0; k < vrp.numTypes(); ++k) {
+      if (k) {
+        caps << '/';
+        fixes << '/';
+      }
+      caps << vrp.types()[k].capacity;
+      fixes << vrp.types()[k].fixedCost;
+    }
+    vector<int> per_type = fleet_mix(vrp, best_routes);
+
+    // ate as well as app: app alone leaves the initial get/put position
+    // unspecified, so tellp() could report 0 on a file that already has rows and
+    // the header would be written again mid-file.
+    ofstream csv(csv_path, ios::app | ios::ate);
+    if (!csv) {
+      cerr << "  WARNING: could not open " << csv_path
+           << " -- no CSV row written" << endl;
+      return all_ok ? 0 : 1;
+    }
+    if (csv.tellp() == 0) {
+      csv << "instance,n_customers,n_types,capacities,fixed_costs,"
+             "total_cost,routing_cost,fixed_cost,vehicles_used,mix,";
+      for (size_t k = 0; k < vrp.numTypes(); ++k) {
+        csv << "used_" << vrp.types()[k].letter << ',';
+      }
+      csv << "solve_time_s,routing_cost_check,cost_split_check,"
+             "customers_covered,feasible\n";
+    }
+    csv << argv[1] << ',' << vrp.getSize() - 1 << ',' << vrp.numTypes() << ','
+        << caps.str() << ',' << fixes.str() << ',' << total << ',' << routing
+        << ',' << fixed << ',' << used << ',' << mix_string(vrp, best_routes)
+        << ',';
+    for (size_t k = 0; k < vrp.numTypes(); ++k) {
+      csv << per_type[k] << ',';
+    }
+    csv << total_seconds << ',' << (dist_ok ? "OK" : "MISMATCH") << ','
+        << (split_ok ? "OK" : "MISMATCH") << ',' << (visited ? "OK" : "MISSING")
+        << ',' << (feasible ? "OK" : "VIOLATED") << '\n';
+  }
+
+  // Non-zero exit on a failed check, so a batch run cannot quietly produce a
+  // sheet full of invalid solutions.
+  return all_ok ? 0 : 1;
 }

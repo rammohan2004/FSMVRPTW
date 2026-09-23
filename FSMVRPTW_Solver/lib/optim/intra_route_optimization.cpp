@@ -64,28 +64,82 @@ void tsp_approx(const VRP &vrp,
   }
 }
 
+// The customers of a route, with every depot marker removed.
+//
+// tsp_approx and tsp_2opt both expect a CUSTOMERS-ONLY sequence: each adds the
+// depot legs itself (tsp_2opt computes get_dist(DEPOT, cities[0]) and
+// get_dist(cities[n-1], DEPOT); tsp_approx takes the depot as cities[ncities-1]
+// and fixes it at tour[0]). Their callers, however, used to pass the whole
+// depot-wrapped route, which broke both:
+//
+//   * tsp_approx received THREE depots -- the route's two plus one more
+//     appended -- and nearest-neighbour pulled them together, since d(0,0) = 0
+//     is the most attractive edge on offer. The caller's tour[1..sz] slice then
+//     dropped one, producing routes like "0 0 305 ... 536": leading depot
+//     doubled, trailing depot gone.
+//   * tsp_2opt reversed segments spanning position 0, moving a depot into the
+//     middle of the route.
+//
+// A route that loses its trailing depot still COSTS correctly, because
+// calculate_route_distance adds the depot legs unconditionally. The real damage
+// is to feasibility: verify_route walks the route element by element, so with no
+// trailing depot it never checks the arrival time back at the depot, and a route
+// that overruns the depot's due date passes as valid.
+//
+// This bug is inherited unchanged from the original CVRPTW code, where nothing
+// tested for it. It surfaced here only because step 5 added a routing-cost
+// recomputation that assumes depot-wrapped routes and so disagrees when one is
+// malformed.
+static vector<node_t> customers_of(const vector<node_t> &route) {
+  vector<node_t> customers;
+  customers.reserve(route.size());
+  for (node_t v : route) {
+    if (v != DEPOT) {
+      customers.push_back(v);
+    }
+  }
+  return customers;
+}
+
+// Re-wraps a customer sequence as a proper route [DEPOT, ..., DEPOT].
+static vector<node_t> wrap_with_depots(const vector<node_t> &customers) {
+  vector<node_t> route;
+  route.reserve(customers.size() + 2);
+  route.push_back(DEPOT);
+  for (node_t v : customers) {
+    route.push_back(v);
+  }
+  route.push_back(DEPOT);
+  return route;
+}
+
 vector<vector<node_t>> postprocess_tsp_approx(
     const VRP &vrp, vector<vector<node_t>> &solRoutes) {
   vector<vector<node_t>> modifiedRoutes;
 
   unsigned nroutes = solRoutes.size();
   for (unsigned i = 0; i < nroutes; ++i) {
-    unsigned sz = solRoutes[i].size();
-    vector<node_t> cities(sz + 1);
-    vector<node_t> tour(sz + 1);
-
-    for (unsigned j = 0; j < sz; ++j) {
-      cities[j] = solRoutes[i][j];
+    vector<node_t> customers = customers_of(solRoutes[i]);
+    unsigned n = customers.size();
+    if (n == 0) {
+      modifiedRoutes.push_back(wrap_with_depots(customers));
+      continue;
     }
-    cities[sz] = 0;
 
-    tsp_approx(vrp, cities, tour, sz + 1);
-
-    vector<node_t> curr_route;
-    for (unsigned kk = 1; kk < sz + 1; ++kk) {
-      curr_route.push_back(tour[kk]);
+    // cities = customers followed by the depot; tsp_approx puts cities[n] at
+    // tour[0] and reorders only tour[1..n], so the depot stays fixed at the
+    // front and the customers are what get permuted.
+    vector<node_t> cities(n + 1);
+    vector<node_t> tour(n + 1);
+    for (unsigned j = 0; j < n; ++j) {
+      cities[j] = customers[j];
     }
-    modifiedRoutes.push_back(curr_route);
+    cities[n] = DEPOT;
+
+    tsp_approx(vrp, cities, tour, n + 1);
+
+    vector<node_t> ordered(tour.begin() + 1, tour.begin() + n + 1);
+    modifiedRoutes.push_back(wrap_with_depots(ordered));
   }
   return modifiedRoutes;
 }
@@ -97,27 +151,27 @@ vector<vector<node_t>> postprocess_tsp_approx_parallel(
   
   vector<vector<node_t>> modifiedRoutes(nroutes);
 
+  // Same depot-contract fix as the sequential version above.
   #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < nroutes; ++i) {
-    int sz = solRoutes[i].size();
-    
-    vector<node_t> cities(sz + 1);
-    vector<node_t> tour(sz + 1);
-
-    for (int j = 0; j < sz; ++j) {
-      cities[j] = solRoutes[i][j];
+    vector<node_t> customers = customers_of(solRoutes[i]);
+    int n = static_cast<int>(customers.size());
+    if (n == 0) {
+      modifiedRoutes[i] = wrap_with_depots(customers);
+      continue;
     }
-    cities[sz] = 0;
 
-    tsp_approx(vrp, cities, tour, sz + 1);
-
-    vector<node_t> curr_route;
-    curr_route.reserve(sz); 
-    for (int kk = 1; kk < sz + 1; ++kk) {
-      curr_route.push_back(tour[kk]);
+    vector<node_t> cities(n + 1);
+    vector<node_t> tour(n + 1);
+    for (int j = 0; j < n; ++j) {
+      cities[j] = customers[j];
     }
-    
-    modifiedRoutes[i] = std::move(curr_route);
+    cities[n] = DEPOT;
+
+    tsp_approx(vrp, cities, tour, n + 1);
+
+    vector<node_t> ordered(tour.begin() + 1, tour.begin() + n + 1);
+    modifiedRoutes[i] = wrap_with_depots(ordered);
   }
   
   return modifiedRoutes;
@@ -197,23 +251,18 @@ vector<vector<node_t>> postprocess_2OPT(
 
   unsigned nroutes = final_routes.size();
   for (unsigned i = 0; i < nroutes; ++i) {
-    unsigned sz = final_routes[i].size();
-    vector<node_t> cities(sz);
-    vector<node_t> tour(sz);
+    // tsp_2opt adds the depot legs itself, so it must be given customers only.
+    // Passing the depot-wrapped route let a segment reversal spanning position 0
+    // move a depot into the middle of the route.
+    vector<node_t> cities = customers_of(final_routes[i]);
+    unsigned n = cities.size();
+    vector<node_t> tour(n);
 
-    for (unsigned j = 0; j < sz; ++j) {
-      cities[j] = final_routes[i][j];
+    if (n > 1) {
+      tsp_2opt(vrp, cities, tour, n);
     }
 
-    if (sz > 2) {
-      tsp_2opt(vrp, cities, tour, sz);
-    }
-
-    vector<node_t> curr_route;
-    for (unsigned kk = 0; kk < sz; ++kk) {
-      curr_route.push_back(cities[kk]);
-    }
-    postprocessed_final_routes.push_back(curr_route);
+    postprocessed_final_routes.push_back(wrap_with_depots(cities));
   }
   return postprocessed_final_routes;
 }
@@ -225,28 +274,18 @@ vector<vector<node_t>> postprocess_2OPT_parallel(
   
   vector<vector<node_t>> postprocessed_final_routes(nroutes);
 
+  // Same depot-contract fix as the sequential version above.
   #pragma omp parallel for schedule(dynamic)
-  for (int i = 0; i < nroutes; ++i) { 
-    unsigned sz = final_routes[i].size();
-    
-    vector<node_t> cities(sz);
-    vector<node_t> tour(sz);
+  for (int i = 0; i < nroutes; ++i) {
+    vector<node_t> cities = customers_of(final_routes[i]);
+    unsigned n = cities.size();
+    vector<node_t> tour(n);
 
-    for (unsigned j = 0; j < sz; ++j) {
-      cities[j] = final_routes[i][j];
+    if (n > 1) {
+      tsp_2opt(vrp, cities, tour, n);
     }
 
-    if (sz > 2) {
-      tsp_2opt(vrp, cities, tour, sz);
-    }
-
-    vector<node_t> curr_route;
-    curr_route.reserve(sz); 
-    for (unsigned kk = 0; kk < sz; ++kk) {
-      curr_route.push_back(cities[kk]);
-    }
-    
-    postprocessed_final_routes[i] = std::move(curr_route);
+    postprocessed_final_routes[i] = wrap_with_depots(cities);
   }
   
   return postprocessed_final_routes;

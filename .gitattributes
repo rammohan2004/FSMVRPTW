@@ -1,0 +1,15 @@
+# Everything in this project is edited on Windows but RUN on the Paramshakti
+# cluster (Linux). sbatch rejects a job script containing CRLF outright:
+#
+#   sbatch: error: Batch script contains DOS line breaks (\r\n)
+#
+# and bash silently mis-parses them elsewhere -- `export PARALLEL=1` in a CRLF
+# file sets the variable to "1\r", which then fails every string comparison.
+#
+# So: force LF in the working tree for every file that a Linux tool reads.
+* text=auto eol=lf
+
+# Binary, never touch.
+*.png binary
+*.pdf binary
+*.zip binary

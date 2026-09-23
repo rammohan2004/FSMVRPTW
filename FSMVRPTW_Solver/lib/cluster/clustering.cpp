@@ -32,7 +32,7 @@ vector<vector<int>> clustering_sweep(const VRP &vrp) {
 
   double depot_x = vrp.node[0].x;
   double depot_y = vrp.node[0].y;
-  double max_capacity = vrp.getCapacity();
+  double max_capacity = vrp.maxCapacity();
 
   vector<PolarCustomer> sweep_list;
   sweep_list.reserve(n - 1);

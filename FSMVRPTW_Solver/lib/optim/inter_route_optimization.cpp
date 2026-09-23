@@ -6,6 +6,19 @@
 
 using namespace std;
 
+namespace {
+
+// Fixed cost of a route carrying `load` with `ncust` customers.
+//
+// The ncust guard matters: F(0) returns the CHEAPEST vehicle's fixed cost, not
+// zero, so a route emptied by a move would still be charged for a vehicle and
+// the move evaluation would never see the saving that emptying it produces.
+inline double fixed_for(const VRP &vrp, demand_t load, int ncust) {
+  return ncust > 0 ? vrp.F(load) : 0.0;
+}
+
+}  // namespace
+
 void inter_route_relocate(const VRP &vrp, vector<vector<node_t>> &routes) {
   cout<<"Starting sequential inter-route relocate optimization..."<<endl;
   bool improvement = true;
@@ -28,10 +41,30 @@ void inter_route_relocate(const VRP &vrp, vector<vector<node_t>> &routes) {
         const auto &routeB = routes[r2];
         if (routeA.size() <= 2) continue;
 
+        // FLEET-AWARE. Relocating a customer changes both routes' loads, which
+        // can push either across a vehicle-capacity threshold and change which
+        // vehicle it needs. Scored on distance alone the move happily traded a
+        // cheap vehicle for a dearer one; on these instances fixed cost is ~64%
+        // of the objective, so that is the majority of what is at stake.
+        // Hoisted out of the i/j loops: it depends only on the route pair.
+        const demand_t loadA = vrp.get_route_load(routeA);
+        const demand_t loadB = vrp.get_route_load(routeB);
+        const int nA = static_cast<int>(routeA.size()) - 2;
+        const int nB = static_cast<int>(routeB.size()) - 2;
+        const double fixedA_before = fixed_for(vrp, loadA, nA);
+        const double fixedB_before = fixed_for(vrp, loadB, nB);
+
         for (size_t i = 1; i < routeA.size() - 1; i++) {
           node_t u = routeA[i];
           node_t t = routeA[i - 1];
           node_t w = routeA[i + 1];
+
+          const demand_t du = vrp.node[u].demand;
+          // Route A may empty entirely here -- that is the big win, and the
+          // ncust guard in fixed_for is what lets the move see it.
+          const double fixed_delta =
+              (fixed_for(vrp, loadA - du, nA - 1) - fixedA_before) +
+              (fixed_for(vrp, loadB + du, nB + 1) - fixedB_before);
 
           double savings_A =
               vrp.get_dist(t, u) + vrp.get_dist(u, w) - vrp.get_dist(t, w);
@@ -42,7 +75,7 @@ void inter_route_relocate(const VRP &vrp, vector<vector<node_t>> &routes) {
 
             double cost_B =
                 vrp.get_dist(x, u) + vrp.get_dist(u, y) - vrp.get_dist(x, y);
-            double total_gain = savings_A - cost_B;
+            double total_gain = savings_A - cost_B - fixed_delta;
 
             if (total_gain > global_best_gain) {
               vector<node_t> new_routeA = routeA;
@@ -114,10 +147,23 @@ void inter_route_relocate_parallel(const VRP &vrp, vector<vector<node_t>> &route
           
           if (routeA.size() <= 2) continue;
 
+          // Fleet-aware, as in the sequential version above.
+          const demand_t loadA = vrp.get_route_load(routeA);
+          const demand_t loadB = vrp.get_route_load(routeB);
+          const int nA = static_cast<int>(routeA.size()) - 2;
+          const int nB = static_cast<int>(routeB.size()) - 2;
+          const double fixedA_before = fixed_for(vrp, loadA, nA);
+          const double fixedB_before = fixed_for(vrp, loadB, nB);
+
           for (size_t i = 1; i < routeA.size() - 1; i++) {
             node_t u = routeA[i];
             node_t t = routeA[i - 1];
             node_t w = routeA[i + 1];
+
+            const demand_t du = vrp.node[u].demand;
+            const double fixed_delta =
+                (fixed_for(vrp, loadA - du, nA - 1) - fixedA_before) +
+                (fixed_for(vrp, loadB + du, nB + 1) - fixedB_before);
 
             double savings_A = vrp.get_dist(t, u) + vrp.get_dist(u, w) - vrp.get_dist(t, w);
 
@@ -126,7 +172,7 @@ void inter_route_relocate_parallel(const VRP &vrp, vector<vector<node_t>> &route
               node_t y = routeB[j];
 
               double cost_B = vrp.get_dist(x, u) + vrp.get_dist(u, y) - vrp.get_dist(x, y);
-              double total_gain = savings_A - cost_B;
+              double total_gain = savings_A - cost_B - fixed_delta;
 
               if (total_gain > local_best_gain) {
                 
@@ -217,7 +263,19 @@ void inter_route_swap(const VRP &vrp, vector<vector<node_t>> &routes) {
                                  vrp.get_dist(x, v) + vrp.get_dist(v, y);
             double cost_after = vrp.get_dist(t, v) + vrp.get_dist(v, w) +
                                 vrp.get_dist(x, u) + vrp.get_dist(u, y);
-            double total_gain = cost_before - cost_after;
+            // Fleet-aware: a swap changes both loads, so it can change which
+            // vehicle each route needs even though neither route changes length.
+            const double swapped_A =
+                base_load_A - vrp.node[u].demand + vrp.node[v].demand;
+            const double swapped_B =
+                base_load_B - vrp.node[v].demand + vrp.node[u].demand;
+            // Neither route can empty (both are guarded size > 2), so the counts
+            // are unchanged and any positive value serves as the ncust argument.
+            const double swap_fixed_delta =
+                (fixed_for(vrp, swapped_A, 1) + fixed_for(vrp, swapped_B, 1)) -
+                (fixed_for(vrp, base_load_A, 1) + fixed_for(vrp, base_load_B, 1));
+
+            double total_gain = cost_before - cost_after - swap_fixed_delta;
 
             if (total_gain > global_best_gain) {
               double new_load_A =
@@ -225,8 +283,8 @@ void inter_route_swap(const VRP &vrp, vector<vector<node_t>> &routes) {
               double new_load_B =
                   base_load_B - vrp.node[v].demand + vrp.node[u].demand;
 
-              if (new_load_A <= vrp.getCapacity() &&
-                  new_load_B <= vrp.getCapacity()) {
+              if (new_load_A <= vrp.maxCapacity() &&
+                  new_load_B <= vrp.maxCapacity()) {
                 vector<node_t> new_routeA = routeA;
                 vector<node_t> new_routeB = routeB;
 
@@ -307,14 +365,24 @@ void inter_route_swap_parallel(const VRP &vrp, vector<vector<node_t>> &routes) {
                                    vrp.get_dist(x, v) + vrp.get_dist(v, y);
               double cost_after = vrp.get_dist(t, v) + vrp.get_dist(v, w) +
                                   vrp.get_dist(x, u) + vrp.get_dist(u, y);
-              
-              double total_gain = cost_before - cost_after;
+
+              // Fleet-aware, as in the sequential swap.
+              const double swapped_A =
+                  base_load_A - vrp.node[u].demand + vrp.node[v].demand;
+              const double swapped_B =
+                  base_load_B - vrp.node[v].demand + vrp.node[u].demand;
+              const double swap_fixed_delta =
+                  (fixed_for(vrp, swapped_A, 1) + fixed_for(vrp, swapped_B, 1)) -
+                  (fixed_for(vrp, base_load_A, 1) +
+                   fixed_for(vrp, base_load_B, 1));
+
+              double total_gain = cost_before - cost_after - swap_fixed_delta;
 
               if (total_gain > local_best_gain) {
                 double new_load_A = base_load_A - vrp.node[u].demand + vrp.node[v].demand;
                 double new_load_B = base_load_B - vrp.node[v].demand + vrp.node[u].demand;
 
-                if (new_load_A <= vrp.getCapacity() && new_load_B <= vrp.getCapacity()) {
+                if (new_load_A <= vrp.maxCapacity() && new_load_B <= vrp.maxCapacity()) {
                   vector<node_t> new_routeA = routeA;
                   vector<node_t> new_routeB = routeB;
 
@@ -378,6 +446,17 @@ void inter_route_2opt_star(const VRP &vrp, vector<vector<node_t>> &routes) {
 
         if (routeA.size() <= 2 || routeB.size() <= 2) continue;
 
+        // Prefix loads, so a tail exchange's resulting loads are O(1) to score.
+        vector<demand_t> prefA(routeA.size()), prefB(routeB.size());
+        prefA[0] = vrp.node[routeA[0]].demand;
+        for (size_t k = 1; k < routeA.size(); ++k)
+          prefA[k] = prefA[k - 1] + vrp.node[routeA[k]].demand;
+        prefB[0] = vrp.node[routeB[0]].demand;
+        for (size_t k = 1; k < routeB.size(); ++k)
+          prefB[k] = prefB[k - 1] + vrp.node[routeB[k]].demand;
+        const demand_t loadA_total = prefA.back();
+        const demand_t loadB_total = prefB.back();
+
         for (size_t i = 0; i < routeA.size() - 1; i++) {
           node_t t = routeA[i];
           node_t u = routeA[i + 1];
@@ -388,7 +467,23 @@ void inter_route_2opt_star(const VRP &vrp, vector<vector<node_t>> &routes) {
 
             double cost_before = vrp.get_dist(t, u) + vrp.get_dist(x, v);
             double cost_after = vrp.get_dist(t, v) + vrp.get_dist(x, u);
-            double total_gain = cost_before - cost_after;
+            // Fleet-aware. 2-opt* exchanges route TAILS, so each new route is a
+            // prefix of one and a suffix of the other; the loads follow from the
+            // prefix sums hoisted above. Either route can end up empty, which is
+            // exactly the case worth finding, so the customer counts are tracked
+            // and fixed_for charges nothing for an empty route.
+            const demand_t newA = prefA[i] + (loadB_total - prefB[j]);
+            const demand_t newB = prefB[j] + (loadA_total - prefA[i]);
+            const int lenA = static_cast<int>(routeA.size());
+            const int lenB = static_cast<int>(routeB.size());
+            const int ncA = static_cast<int>(i) + max(0, lenB - 2 - static_cast<int>(j));
+            const int ncB = static_cast<int>(j) + max(0, lenA - 2 - static_cast<int>(i));
+            const double opt_fixed_delta =
+                (fixed_for(vrp, newA, ncA) + fixed_for(vrp, newB, ncB)) -
+                (fixed_for(vrp, loadA_total, lenA - 2) +
+                 fixed_for(vrp, loadB_total, lenB - 2));
+
+            double total_gain = cost_before - cost_after - opt_fixed_delta;
 
             if (total_gain > global_best_gain) {
               vector<node_t> new_routeA;
@@ -410,8 +505,8 @@ void inter_route_2opt_star(const VRP &vrp, vector<vector<node_t>> &routes) {
               double new_load_A = vrp.get_route_load(new_routeA);
               double new_load_B = vrp.get_route_load(new_routeB);
 
-              if (new_load_A <= vrp.getCapacity() &&
-                  new_load_B <= vrp.getCapacity()) {
+              if (new_load_A <= vrp.maxCapacity() &&
+                  new_load_B <= vrp.maxCapacity()) {
                 if (verify_single_route(vrp, new_routeA) &&
                     verify_single_route(vrp, new_routeB)) {
                   global_best_gain = total_gain;
@@ -477,6 +572,17 @@ void inter_route_2opt_star_parallel(const VRP &vrp, vector<vector<node_t>> &rout
             continue;
           }
 
+          // Prefix loads, as in the sequential version.
+          vector<demand_t> prefA(routeA.size()), prefB(routeB.size());
+          prefA[0] = vrp.node[routeA[0]].demand;
+          for (size_t k = 1; k < routeA.size(); ++k)
+            prefA[k] = prefA[k - 1] + vrp.node[routeA[k]].demand;
+          prefB[0] = vrp.node[routeB[0]].demand;
+          for (size_t k = 1; k < routeB.size(); ++k)
+            prefB[k] = prefB[k - 1] + vrp.node[routeB[k]].demand;
+          const demand_t loadA_total = prefA.back();
+          const demand_t loadB_total = prefB.back();
+
           for (size_t i = 0; i < routeA.size() - 1; i++) {
             node_t t = routeA[i];
             node_t u = routeA[i + 1];
@@ -487,7 +593,22 @@ void inter_route_2opt_star_parallel(const VRP &vrp, vector<vector<node_t>> &rout
 
               double cost_before = vrp.get_dist(t, u) + vrp.get_dist(x, v);
               double cost_after = vrp.get_dist(t, v) + vrp.get_dist(x, u);
-              double total_gain = cost_before - cost_after;
+
+              // Fleet-aware, as in the sequential 2-opt*.
+              const demand_t newA = prefA[i] + (loadB_total - prefB[j]);
+              const demand_t newB = prefB[j] + (loadA_total - prefA[i]);
+              const int lenA = static_cast<int>(routeA.size());
+              const int lenB = static_cast<int>(routeB.size());
+              const int ncA =
+                  static_cast<int>(i) + max(0, lenB - 2 - static_cast<int>(j));
+              const int ncB =
+                  static_cast<int>(j) + max(0, lenA - 2 - static_cast<int>(i));
+              const double opt_fixed_delta =
+                  (fixed_for(vrp, newA, ncA) + fixed_for(vrp, newB, ncB)) -
+                  (fixed_for(vrp, loadA_total, lenA - 2) +
+                   fixed_for(vrp, loadB_total, lenB - 2));
+
+              double total_gain = cost_before - cost_after - opt_fixed_delta;
 
               if (total_gain > local_best_gain) {
                 
@@ -508,7 +629,7 @@ void inter_route_2opt_star_parallel(const VRP &vrp, vector<vector<node_t>> &rout
                 double new_load_A = vrp.get_route_load(new_routeA);
                 double new_load_B = vrp.get_route_load(new_routeB);
 
-                if (new_load_A <= vrp.getCapacity() && new_load_B <= vrp.getCapacity()) {
+                if (new_load_A <= vrp.maxCapacity() && new_load_B <= vrp.maxCapacity()) {
                   if (verify_single_route(vrp, new_routeA) && verify_single_route(vrp, new_routeB)) {
                     
                     local_best_gain = total_gain;
@@ -553,6 +674,10 @@ void inter_route_2opt_star_parallel(const VRP &vrp, vector<vector<node_t>> &rout
 }
 
 
+// NOT CALLED from solve_cvrptw.cpp, and still FLEET-BLIND: its gain is pure
+// distance, with no F(load) term, so it can trade a cheap vehicle for a dearer
+// one and raise total cost while reporting an improvement. Give it the same
+// treatment as inter_route_relocate above before enabling it.
 void updated_relocate(const VRP &vrp, vector<vector<node_t>> &routes) {
   bool improvement = true;
 

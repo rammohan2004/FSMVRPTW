@@ -58,3 +58,7 @@ Solver-Port-Plan.md
 
 .claude/*.json
 .claude/
+
+Parallel-Vehicle-Downgrade-Algorithm.md
+Consolidation-Algorithm.md
+Changes-From-Dinesh-Codebase.md

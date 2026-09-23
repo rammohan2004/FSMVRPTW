@@ -7,6 +7,67 @@
 
 using namespace std;
 
+// Golden et al.'s fixed-cost savings term for merging two routes.
+//
+// Merging retires one vehicle and may change the type of the survivor, so the
+// saving is F(z_i) + F(z_j) - F(z_i + z_j) -- where F(z) is the fixed cost of the
+// cheapest vehicle able to carry load z.
+//
+// Without this the merge criterion was pure distance, so a merge that eliminated
+// an entire vehicle scored no better than one that did not. On the wide-time-
+// window families that is the whole problem: step 6 measured fixed cost at ~64%
+// of the objective, and on R2 this term is worth up to 2,795 against distance
+// savings of tens of units -- our vehicles ran 31% full there where cuOpt's ran
+// 96% full.
+//
+// The caller has already rejected merges exceeding the largest capacity, so F
+// never returns infinity here.
+//
+// WEIGHTED, because the raw term is the wrong scale. Added unweighted it is worth
+// hundreds while a distance saving is worth tens, so merge order stops depending
+// on geometry and the beta*waiting time-window penalty is swamped entirely. The
+// routes that result are temporally poor, later merges fail the feasibility
+// check, and the construction ends with MORE vehicles rather than fewer.
+// Measured on one instance per family: unweighted (w=1) moved construction cost
+// by -15% on R2 but +19% on C1. Golden et al. and the FSMVRPTW literature after
+// them carry a tuning parameter here for exactly this reason.
+//
+// DEFAULT 0 -- the term is DISABLED, because measurement says it does not work
+// here. Swept over w in {0, 0.05, 0.1, 0.25, 0.5, 1.0} on one instance per
+// family, no weight gave a consistent gain, and critically R2's vehicle count
+// stayed at 38-43 for every w against cuOpt's 16. The savings term cannot
+// consolidate, for a structural reason it cannot fix:
+//
+//   Clarke-Wright merges by CONCATENATING two routes end to end (four
+//   orientations). Concatenation preserves each route's internal order, so it
+//   can never interleave their customers. Under wide time windows a 70-customer
+//   route has to thread its customers in time order, which requires interleaving,
+//   so no sequence of concatenations can build one however it is scored.
+//
+// Reweighting the merge criterion cannot lift a restriction on which merges are
+// expressible at all. Consolidation needs a move that redistributes customers
+// individually -- section G.
+//
+// Kept, parameterised and documented rather than deleted: it is the standard
+// textbook approach, the negative result is a finding worth defending, and a
+// full 60-instance sweep may yet find a small consistent gain.
+//
+// Sweep with:  g++ ... -DFIXED_COST_WEIGHT=0.05
+#ifndef FIXED_COST_WEIGHT
+#define FIXED_COST_WEIGHT 0.0
+#endif
+
+static inline double fixed_cost_saving(const VRP &vrp, double load_i,
+                                       double load_j) {
+  // A literal macro makes this a compile-time constant, so at the default of 0
+  // the whole term including the F() lookups folds away to nothing.
+  if (FIXED_COST_WEIGHT == 0.0) {
+    return 0.0;
+  }
+  return FIXED_COST_WEIGHT *
+         (vrp.F(load_i) + vrp.F(load_j) - vrp.F(load_i + load_j));
+}
+
 vector<vector<node_t>> clarke_wright_cvrptw(
     const VRP &vrp, const vector<vector<int>> &clusters) {
       cout<<"Running sequential Clarke & Wright..."<<endl;
@@ -63,7 +124,7 @@ vector<vector<node_t>> clarke_wright_cvrptw(
             continue;
           }
 
-          if (route_demand[r_i] + route_demand[r_j] > vrp.getCapacity()) {
+          if (route_demand[r_i] + route_demand[r_j] > vrp.maxCapacity()) {
             continue;
           }
 
@@ -136,7 +197,10 @@ vector<vector<node_t>> clarke_wright_cvrptw(
               waiting = vrp.node[to].earlyTime - arrival_to;
             }
 
-            double total_saving = alpha * dist_saving - beta * waiting;
+            double total_saving =
+                alpha * (dist_saving + fixed_cost_saving(
+                             vrp, route_demand[r_i], route_demand[r_j])) -
+                beta * waiting;
             if (!verify_route(cand.merged)) {
               continue;
             }
@@ -249,7 +313,7 @@ vector<vector<node_t>> clarke_wright_cvrptw_parallel(
             if (routes[r_j].empty()) continue;
             
             
-            if (route_demand[r_i] + route_demand[r_j] > vrp.getCapacity()) {
+            if (route_demand[r_i] + route_demand[r_j] > vrp.maxCapacity()) {
               continue;
             }
 
@@ -320,7 +384,10 @@ vector<vector<node_t>> clarke_wright_cvrptw_parallel(
                 waiting = vrp.node[to].earlyTime - arrival_to;
               }
 
-              double total_saving = alpha * dist_saving - beta * waiting;
+              double total_saving =
+                alpha * (dist_saving + fixed_cost_saving(
+                             vrp, route_demand[r_i], route_demand[r_j])) -
+                beta * waiting;
               
               
               if (!verify_route(cand.merged)) continue;
@@ -433,7 +500,7 @@ vector<vector<node_t>> clarke_wright_cvrptw_parallel_v2(
             continue;
           }
 
-          if (route_demand[r_i] + route_demand[r_j] > vrp.getCapacity()) {
+          if (route_demand[r_i] + route_demand[r_j] > vrp.maxCapacity()) {
             continue;
           }
 
@@ -506,7 +573,10 @@ vector<vector<node_t>> clarke_wright_cvrptw_parallel_v2(
               waiting = vrp.node[to].earlyTime - arrival_to;
             }
 
-            double total_saving = alpha * dist_saving - beta * waiting;
+            double total_saving =
+                alpha * (dist_saving + fixed_cost_saving(
+                             vrp, route_demand[r_i], route_demand[r_j])) -
+                beta * waiting;
             if (!verify_route(cand.merged)) {
               continue;
             }
@@ -604,7 +674,7 @@ vector<vector<node_t>> clarke_wright_cvrptw_distance(
         continue;
       }
 
-      if (route_demand[r_i] + route_demand[r_j] > vrp.getCapacity()) {
+      if (route_demand[r_i] + route_demand[r_j] > vrp.maxCapacity()) {
         continue;
       }
 
